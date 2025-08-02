@@ -220,7 +220,6 @@ class SelectorAgent:
         self.prompt_file = "prompt/prompt_selector.txt"
         os.makedirs(self.knowledge_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
-        # Initialize prompt file if not exists
         if not os.path.exists(self.prompt_file):
             initial_prompt = """You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous selector reflections, choose the best SQL. 
 Consider correctness (if executable, prefer matching intent), efficiency (simpler queries preferred), and alignment with question intent. Use reflections to avoid past mistakes.
@@ -252,7 +251,6 @@ Selected SQL: <sql>
     def select_sql(self, question, schema, candidates):
         reflection = self.get_latest_selector_reflection()
         candidates_str = "\n".join([f"Style: {style}, SQL: {sql}" for style, sql in candidates])
-        # Read prompt from file
         with open(self.prompt_file, 'r', encoding='utf-8') as f:
             prompt_template = f.read()
         prompt = prompt_template.format(
@@ -351,8 +349,14 @@ class SelectorAgentTeacher:
         self.knowledge_dir = "./knowledge/selector"
         self.prompt_file = "prompt/prompt_selector.txt"
         self.prompt_backup_prefix = "prompt_selector_"
+        self.manifest_file = "prompt/manifest.json"
         os.makedirs(self.knowledge_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
+        os.makedirs(os.path.dirname(self.manifest_file), exist_ok=True)
+        # Initialize manifest if not exists
+        if not os.path.exists(self.manifest_file):
+            with open(self.manifest_file, 'w', encoding='utf-8') as f:
+                json.dump([], f)
 
     def get_latest_selector_reflection(self):
         files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
@@ -363,27 +367,40 @@ class SelectorAgentTeacher:
             reflections = json.load(f)
         return reflections, latest_file
 
-    def rewrite_prompt(self):
-        """Backup current prompt, rewrite based on reflections, deduplicate, and save new reflection."""
+    def generate_prompt_diff_summary(self, old_prompt, new_prompt):
+        prompt = f"""Summarize the key changes between the old and new selector prompts in one concise sentence. Focus on high-level differences (e.g., added emphasis on joins, removed subquery bias).
+
+# Old Prompt:
+{old_prompt}
+
+# New Prompt:
+{new_prompt}
+
+# Output only the summary sentence:
+"""
+        response = self.call_llm(prompt)
+        return response.strip()
+
+    def rewrite_prompt(self, selector_accuracy):
+        """Backup current prompt, rewrite based on reflections, save empty reflection file, and log metadata."""
         reflections, latest_file = self.get_latest_selector_reflection()
         general_reflections = reflections.get("general", [])
         reflections_str = "\n".join(general_reflections)
 
         # Backup current prompt
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        backup_filename = os.path.join(os.path.dirname(self.prompt_file), f"{self.prompt_backup_prefix}{timestamp}.txt")
         if os.path.exists(self.prompt_file):
             with open(self.prompt_file, 'r', encoding='utf-8') as f:
                 current_prompt = f.read()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-            backup_filename = os.path.join(os.path.dirname(self.prompt_file), f"{self.prompt_backup_prefix}{timestamp}.txt")
             with open(backup_filename, 'w', encoding='utf-8') as f:
                 f.write(current_prompt)
             print(f"🧠 Backed up current selector prompt to {backup_filename}")
+        else:
+            current_prompt = ""
 
-        # Read current prompt (for rewrite)
-        with open(self.prompt_file, 'r', encoding='utf-8') as f:
-            current_prompt = f.read()
-
-        prompt = f"""You are a prompt optimization expert. Given the current selector prompt and accumulated selector reflections, rewrite the prompt to incorporate key lessons for better SQL selection. 
+        # Rewrite prompt
+        rewrite_prompt = f"""You are a prompt optimization expert. Given the current selector prompt and accumulated selector reflections, rewrite the prompt to incorporate key lessons for better SQL selection. 
 Ensure the rewritten prompt remains concise, improves selection accuracy, and retains the output format: 'Selected Style: <style>\nSelected SQL: <sql>'.
 Avoid specific table/column names; focus on general patterns (e.g., prioritizing joins for multi-table queries).
 
@@ -395,20 +412,39 @@ Avoid specific table/column names; focus on general patterns (e.g., prioritizing
 
 # Output only the rewritten prompt:
 """
-        response = self.call_llm(prompt)
+        new_prompt = self.call_llm(rewrite_prompt)
 
         # Save rewritten prompt
         with open(self.prompt_file, 'w', encoding='utf-8') as f:
-            f.write(response)
+            f.write(new_prompt)
 
-        # Deduplicate reflections and save new file
-        deduped_reflections = {"general": list(dict.fromkeys(general_reflections))}
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        # Generate diff summary
+        diff_summary = self.generate_prompt_diff_summary(current_prompt, new_prompt) if current_prompt else "Initial prompt created."
+
+        # Log metadata to manifest
+        manifest_entry = {
+            "reset_id": timestamp,
+            "timestamp": datetime.now().isoformat(),
+            "pre_reset_reflection_count": len(general_reflections),
+            "pre_reset_selector_accuracy": selector_accuracy,
+            "prompt_diff_summary": diff_summary,
+            "backup_prompt_file": backup_filename,
+            "previous_reflection_file": latest_file if latest_file else "None",
+            "notes": f"Triggered by --rewrite-selector-size={len(general_reflections)}"
+        }
+        with open(self.manifest_file, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        manifest.append(manifest_entry)
+        with open(self.manifest_file, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=4)
+
+        # Save empty reflection file to reset accumulation
+        empty_reflections = {"general": []}
         new_filename = os.path.join(self.knowledge_dir, f"selector_reflection_{timestamp}.json")
         with open(new_filename, 'w', encoding='utf-8') as f:
-            json.dump(deduped_reflections, f, indent=4)
+            json.dump(empty_reflections, f, indent=4)
 
-        return response, deduped_reflections
+        return new_prompt, empty_reflections
 
     def call_llm(self, prompt):
         res = self.client.chat.completions.create(

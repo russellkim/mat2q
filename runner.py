@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import argparse
 import json
 
-async def main(idx, example, schema):
+async def main(idx, example, schema, reflection_age_counter, selector_correct_count, total_examples_processed):
     print(f"Running example {idx}...")
 
     question, db_id, gold_sql = example["question"], example["db_id"], example["query"]
@@ -18,8 +18,7 @@ async def main(idx, example, schema):
     
     # 1. Multiple SQL Generator Agents with different strategies
     print("🧠 Generating SQL...")      
-    #agent_styles = ["default", "join-first", "subquery", "aggregation"]
-    agent_styles = ["default"]    
+    agent_styles = ["default", "join-first", "subquery", "aggregation"]
     
     # Create agents and use them as async context managers
     agents = [
@@ -111,23 +110,27 @@ async def main(idx, example, schema):
         latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(selector_teacher.knowledge_dir, x)))
         with open(os.path.join(selector_teacher.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
             latest_reflections = json.load(f)
-        if len(latest_reflections.get("general", [])) >= args.rewrite_selector_size:
+        reflection_count = len(latest_reflections.get("general", []))
+        # Compute current selector accuracy
+        selector_accuracy = (selector_correct_count / total_examples_processed * 100) if total_examples_processed > 0 else 0
+        # Check both size and age
+        if reflection_count >= args.rewrite_selector_size and reflection_age_counter >= args.min_reflection_age:
             print(f"🧠 Rewriting selector prompt at example {idx}...")
-            new_prompt, deduped_reflections = selector_teacher.rewrite_prompt()
+            new_prompt, deduped_reflections = selector_teacher.rewrite_prompt(selector_accuracy)
             rewrite_triggered = True
             print(f"🧠 New Selector Prompt:\n{new_prompt}")
-            print(f"🧠 Deduplicated Selector Reflections:")
-            for insight in deduped_reflections["general"]:
-                print(f"  {insight}")
+            print(f"🧠 Reset Selector Reflections to Empty")
             print("--------------------------------\n")
+            reflection_age_counter = 0  # Reset counter after rewrite
     
-    return style_correct_dict, selector_correct, rewrite_triggered, "ret_error"
+    return style_correct_dict, selector_correct, rewrite_triggered, reflection_age_counter + 1, "ret_error"
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index, number of examples, and selector prompt rewrite size.")
+    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index, number of examples, selector prompt rewrite size, and minimum reflection age.")
     parser.add_argument("--start", type=int, default=95, help="Starting index for dataset (default: 95)")
     parser.add_argument("--n", type=int, default=5, help="Number of examples to process (default: 5)")
     parser.add_argument("--rewrite-selector-size", type=int, default=10, help="Threshold for number of selector reflection items to trigger prompt rewrite (default: 10)")
+    parser.add_argument("--min-reflection-age", type=int, default=5, help="Minimum number of examples since last reflection reset to trigger prompt rewrite (default: 5)")
     args = parser.parse_args()
 
     if args.start < 0:
@@ -136,6 +139,8 @@ if __name__ == "__main__":
         raise ValueError("Number of examples (--n) must be positive.")
     if args.rewrite_selector_size <= 0:
         raise ValueError("Rewrite selector size (--rewrite-selector-size) must be positive.")
+    if args.min_reflection_age <= 0:
+        raise ValueError("Minimum reflection age (--min-reflection-age) must be positive.")
 
     dataset, schemas = load_dataset('./datasets/spider', 'dev')    
 
@@ -153,12 +158,17 @@ if __name__ == "__main__":
     selector_correct_count = 0
     total_correct = 0
     total_error = {'miss': 0}
-    rewrite_count = 0  # Track prompt rewrites
+    rewrite_count = 0
+    reflection_file_count = 0
+    reflection_age_counter = 0  # Track examples since last reset
+    total_examples_processed = 0
 
     for idx in range(start_idx, start_idx + n_examples):
         example = dataset[idx]
         schema = schemas[example["db_id"]]
-        style_correct_dict, selector_correct, rewrite_triggered, error = asyncio.run(main(idx, example, schema))
+        style_correct_dict, selector_correct, rewrite_triggered, reflection_age_counter, error = asyncio.run(
+            main(idx, example, schema, reflection_age_counter, selector_correct_count, total_examples_processed + 1)
+        )
         
         # Update stats
         any_correct = False
@@ -172,6 +182,8 @@ if __name__ == "__main__":
             selector_correct_count += 1
         if rewrite_triggered:
             rewrite_count += 1
+        reflection_file_count += 1  # Increment for each example (new reflection file created)
+        total_examples_processed += 1
     
     print(f"Total examples where at least one style correct: {total_correct}/{n_examples}")
     print("\nPer-Style Performance Statistics:")
@@ -185,3 +197,4 @@ if __name__ == "__main__":
     print(f"Selector: {selector_correct_count}/{n_examples} ({selector_accuracy:.2f}%)")
     
     print(f"\nSelector Prompt Rewrite Events: {rewrite_count}")
+    print(f"Total Reflection Files Created: {reflection_file_count}")
