@@ -1,20 +1,15 @@
 import asyncio
-from agents import SQLPlanGeneratorAgent, VerifierAgent, ReflectionAgent, SelectorAgent, SelectorReflectionAgent
+from agents import SQLPlanGeneratorAgent, VerifierAgent, ReflectionAgent, SelectorAgent, SelectorReflectionAgent, KnowledgeSummarizerAgent
 from utils import load_dataset
 import os
 from dotenv import load_dotenv
 import argparse
 
-async def main(idx, example, schema):
+async def main(idx, example, schema, api_key, base_url, model):
     print(f"Running example {idx}...")
 
     question, db_id, gold_sql = example["question"], example["db_id"], example["query"]
-    
-    load_dotenv()
-    api_key = os.getenv('UPSTAGE_API_KEY_0')
-    base_url = os.getenv('UPSTAGE_API_BASE')
-    model = "solar-pro2"
-    
+        
     # 1. Multiple SQL Generator Agents with different strategies
     print("🧠 Generating SQL...")      
     agent_styles = ["default", "join-first", "subquery", "aggregation"]
@@ -62,7 +57,6 @@ async def main(idx, example, schema):
         else:
             answer = "❌ Incorrect"
 
-        # Extract style from name (e.g., "Agent-default" -> "default")
         style = name.split("-")[1]
         if style not in agent_styles:
             print(f"Warning: Invalid style '{style}' found for {name}. Skipping.")
@@ -104,23 +98,27 @@ async def main(idx, example, schema):
                                                         
     return style_correct_dict, selector_correct, "ret_error"
 
-if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index and number of examples.")
+if __name__ == "__main__":        
+    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index, number of examples, and summarization interval.")
     parser.add_argument("--start", type=int, default=95, help="Starting index for dataset (default: 95)")
     parser.add_argument("--n", type=int, default=5, help="Number of examples to process (default: 5)")
+    parser.add_argument("--summary-interval", type=int, default=10, help="Interval for summarizing reflections (default: 10)")
     args = parser.parse_args()
 
-    # Validate arguments
+    load_dotenv()
+    api_key = os.getenv('UPSTAGE_API_KEY_0')
+    base_url = os.getenv('UPSTAGE_API_BASE')
+    model = "solar-pro2"
+
     if args.start < 0:
         raise ValueError("Start index (--start) must be non-negative.")
     if args.n <= 0:
         raise ValueError("Number of examples (--n) must be positive.")
+    if args.summary_interval <= 0:
+        raise ValueError("Summary interval (--summary-interval) must be positive.")
 
-    # 데이터셋 로드
     dataset, schemas = load_dataset('./datasets/spider', 'dev')    
 
-    # Validate dataset bounds
     if args.start >= len(dataset):
         raise ValueError(f"Start index ({args.start}) exceeds dataset size ({len(dataset)}).")
     if args.start + args.n > len(dataset):
@@ -129,18 +127,20 @@ if __name__ == "__main__":
 
     start_idx = args.start
     n_examples = args.n
+    summary_interval = args.summary_interval
     
-    # Initialize per-style and selector correct counts
     agent_styles = ["default", "join-first", "subquery", "aggregation"]
     style_correct_counts = {style: 0 for style in agent_styles}
-    selector_correct_count = 0  # Track selector success
-    total_correct = 0  # Count examples where at least one style is correct
-    total_error = {}
-    total_error['miss'] = 0
+    selector_correct_count = 0
+    total_correct = 0
+    total_error = {'miss': 0}
+    summarization_count = 0  # Track summarizations
+
+    summarizer_agent = KnowledgeSummarizerAgent(api_key=api_key, base_url=base_url, model=model)
     for idx in range(start_idx, start_idx + n_examples):
         example = dataset[idx]
         schema = schemas[example["db_id"]]
-        style_correct_dict, selector_correct, error = asyncio.run(main(idx, example, schema))
+        style_correct_dict, selector_correct, error = asyncio.run(main(idx, example, schema, api_key, base_url, model))
         
         # Update stats
         any_correct = False
@@ -152,18 +152,32 @@ if __name__ == "__main__":
             total_correct += 1
         if selector_correct:
             selector_correct_count += 1
-            
-    # Print overall stats
-    print(f"Total examples where at least one style correct: {total_correct}/{n_examples}")
+        
+        # Summarize if at interval
+        if (idx - start_idx + 1) % summary_interval == 0:
+            print(f"🧠 Summarizing reflections at example {idx}...")
+            base_summary = summarizer_agent.summarize_reflections(is_selector=False)
+            selector_summary = summarizer_agent.summarize_reflections(is_selector=True)
+            summarization_count += 1
+            print(f"🧠 Base Agent Summary:")
+            for section, insights in base_summary.items():
+                print(f"  {section.capitalize()}:")
+                for insight in insights:
+                    print(f"    {insight}")
+            print(f"🧠 Selector Summary:")
+            for insight in selector_summary["general"]:
+                print(f"  {insight}")
+            print("--------------------------------\n")
     
-    # Print per-style stats
+    print(f"Total examples where at least one style correct: {total_correct}/{n_examples}")
     print("\nPer-Style Performance Statistics:")
     for style in agent_styles:
         correct = style_correct_counts[style]
         accuracy = (correct / n_examples) * 100 if n_examples > 0 else 0
         print(f"Style '{style}': {correct}/{n_examples} ({accuracy:.2f}%)")
     
-    # Print selector stats
     print("\nSelector Performance Statistics:")
     selector_accuracy = (selector_correct_count / n_examples) * 100 if n_examples > 0 else 0
     print(f"Selector: {selector_correct_count}/{n_examples} ({selector_accuracy:.2f}%)")
+    
+    print(f"\nSummarization Events: {summarization_count}")

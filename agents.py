@@ -6,7 +6,7 @@ from utils import extract_sql_from_response
 import difflib
 from datetime import datetime
 import json
-import re  # For parsing LLM output
+import re
 
 class SQLPlanGeneratorAgent:
     def __init__(self, api_key, base_url, model="gpt-3.5-turbo", style="default"):
@@ -25,16 +25,18 @@ class SQLPlanGeneratorAgent:
             await self.client.close()
     
     async def cleanup(self):
-        """Close the async client properly"""
         if self.client:
             await self.client.close()
 
     def get_latest_reflection(self):
-        """Read the most recent reflection JSON from the knowledge directory, extract general + style-specific."""
+        """Read the most recent summary or reflection JSON from the knowledge directory."""
         knowledge_dir = "./knowledge"
         if not os.path.exists(knowledge_dir):
             return ""
-        files = [f for f in os.listdir(knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
+        # Prioritize summaries
+        files = [f for f in os.listdir(knowledge_dir) if f.startswith("summary_") and f.endswith(".json")]
+        if not files:
+            files = [f for f in os.listdir(knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
         if not files:
             return ""
         latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(knowledge_dir, x)))
@@ -50,10 +52,7 @@ class SQLPlanGeneratorAgent:
         return combined.strip()
 
     async def generate_full_sql_async(self, question, schema_info):
-        # ① Read latest reflection (general + style-specific)
         reflection = self.get_latest_reflection()
-
-        # ② Plan 생성
         plan_prompt = f"""You are a planner. Given the question, schema, and previous reflections (general and style-specific), decompose into SQL plan steps. DO NOT use user functions and REGEXP, GLOB, CAST.
 
 # Question:
@@ -69,7 +68,6 @@ class SQLPlanGeneratorAgent:
         print(self.style, "Plan Prompt...")
         plan = await self.call_llm_async(plan_prompt)
 
-        # ③ SQL 생성
         style_prompt = {
             "default": "",
             "join-first": "Prefer explicit joins before selecting columns.",
@@ -134,7 +132,6 @@ class ReflectionAgent:
         self.styles = ["default", "join-first", "subquery", "aggregation"]
 
     def generate_insights(self, question, schema, golden_sql, styled_predictions):
-        """Use LLM to generate general + style-specific insights."""
         diffs = []
         predicted_sqls_str = []
         for i, style in enumerate(self.styles):
@@ -169,7 +166,6 @@ Focus on abstract patterns; avoid references to specific tables/columns/question
 # SQL Diffs: {diff_text}
 """
         response = self.call_llm(prompt)
-        # Parse response into dict
         insights = {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
         current_key = None
         for line in response.splitlines():
@@ -197,22 +193,18 @@ Focus on abstract patterns; avoid references to specific tables/columns/question
         return res.choices[0].message.content.strip()
 
     def merge_reflections(self, new_insights):
-        """Merge new insights dict with the latest reflection JSON."""
         latest_reflections = {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
-        knowledge_dir = self.knowledge_dir
-        files = [f for f in os.listdir(knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
+        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
         if files:
-            latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(knowledge_dir, x)))
-            with open(os.path.join(knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
+            latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
+            with open(os.path.join(self.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
                 latest_reflections = json.load(f)
-
         for key in latest_reflections:
             combined = latest_reflections[key] + new_insights.get(key, [])
             latest_reflections[key] = list(dict.fromkeys(combined))
         return latest_reflections
 
     def save_reflection(self, question, schema, golden_sql, styled_predictions):
-        """Save reflection insights to a timestamped JSON file."""
         insights = self.generate_insights(question, schema, golden_sql, styled_predictions)
         merged_insights = self.merge_reflections(insights)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -231,8 +223,10 @@ class SelectorAgent:
         os.makedirs(self.knowledge_dir, exist_ok=True)
 
     def get_latest_selector_reflection(self):
-        """Read the most recent selector reflection JSON."""
-        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
+        """Read the most recent selector summary or reflection JSON."""
+        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_summary_") and f.endswith(".json")]
+        if not files:
+            files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
         if not files:
             return ""
         latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
@@ -242,10 +236,8 @@ class SelectorAgent:
         return "# Previous Selector Reflections:\n" + "\n".join(general)
 
     def select_sql(self, question, schema, candidates):
-        """Select the best SQL from candidates using LLM."""
         reflection = self.get_latest_selector_reflection()
         candidates_str = "\n".join([f"Style: {style}, SQL: {sql}" for style, sql in candidates])
-
         prompt = f"""You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous selector reflections, choose the best SQL. 
 Consider correctness (if executable, prefer matching intent), efficiency (simpler queries preferred), and alignment with question intent. Use reflections to avoid past mistakes.
 Output only in this format:
@@ -262,8 +254,8 @@ Selected SQL: <sql>
 """
         response = self.call_llm(prompt)
         lines = response.splitlines()
-        selected_style = lines[0].split(": ")[1] if lines else candidates[0][0]  # Fallback to first style
-        selected_sql = lines[1].split(": ")[1] if len(lines) > 1 else candidates[0][1]  # Fallback to first SQL
+        selected_style = lines[0].split(": ")[1] if lines else candidates[0][0]
+        selected_sql = lines[1].split(": ")[1] if len(lines) > 1 else candidates[0][1]
         return selected_style, selected_sql
 
     def call_llm(self, prompt):
@@ -284,14 +276,12 @@ class SelectorReflectionAgent:
         os.makedirs(self.knowledge_dir, exist_ok=True)
 
     def generate_insights(self, question, schema, golden_sql, selected_style, selected_sql, was_correct):
-        """Generate reflections on the selector's choice."""
         diff = difflib.unified_diff(
             golden_sql.splitlines(), selected_sql.splitlines(),
             fromfile="golden_sql", tofile="selected_sql", lineterm=""
         )
         diff_text = "\n".join(diff)
         outcome = "correct" if was_correct else "incorrect"
-
         prompt = f"""You are a selector reflection expert. Given the question, schema, golden SQL, selected SQL, and whether the selection was correct, analyze why the choice led to an {outcome} outcome. 
 Provide 3-5 general bullet-point lessons for better future selections, focusing on abstract patterns (e.g., when to prefer join-based styles). Avoid specific table/column names.
 Output only bullet-point lessons starting with "- ".
@@ -323,21 +313,18 @@ Output only bullet-point lessons starting with "- ".
         return res.choices[0].message.content.strip()
 
     def merge_reflections(self, new_insights):
-        """Merge new selector insights with the latest JSON."""
         latest_reflections = {"general": []}
         files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
         if files:
             latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
             with open(os.path.join(self.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
                 latest_reflections = json.load(f)
-
         for key in latest_reflections:
             combined = latest_reflections[key] + new_insights.get(key, [])
             latest_reflections[key] = list(dict.fromkeys(combined))
         return latest_reflections
 
     def save_reflection(self, question, schema, golden_sql, selected_style, selected_sql, was_correct):
-        """Save selector reflection insights to a timestamped JSON file."""
         insights = self.generate_insights(question, schema, golden_sql, selected_style, selected_sql, was_correct)
         merged_insights = self.merge_reflections(insights)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -345,3 +332,80 @@ Output only bullet-point lessons starting with "- ".
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(merged_insights, f, indent=4)
         return merged_insights
+
+class KnowledgeSummarizerAgent:
+    def __init__(self, api_key, base_url, model="solar-pro2"):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.model_name = model
+        self.knowledge_dir = "./knowledge"
+        self.selector_knowledge_dir = "./knowledge/selector"
+        os.makedirs(self.knowledge_dir, exist_ok=True)
+        os.makedirs(self.selector_knowledge_dir, exist_ok=True)
+        self.styles = ["default", "join-first", "subquery", "aggregation"]
+
+    def summarize_reflections(self, is_selector=False):
+        """Summarize all reflections in the given directory."""
+        knowledge_dir = self.selector_knowledge_dir if is_selector else self.knowledge_dir
+        prefix = "selector_reflection_" if is_selector else "reflection_"
+        files = [f for f in os.listdir(knowledge_dir) if f.startswith(prefix) and f.endswith(".json")]
+        if not files:
+            return {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
+        
+        all_insights = {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
+        for file in files:
+            with open(os.path.join(knowledge_dir, file), 'r', encoding='utf-8') as f:
+                insights = json.load(f)
+                for key in all_insights:
+                    all_insights[key].extend(insights.get(key, []))
+        
+        # Deduplicate before summarization
+        for key in all_insights:
+            all_insights[key] = list(dict.fromkeys(all_insights[key]))
+
+        insights_str = "\n".join([f"{key.capitalize()}: " + "; ".join(all_insights[key]) for key in all_insights])
+        output_structure = (
+            "- General lessons: (5-10 concise bullets)\n" +
+            ("- Default style lessons: (2-5 bullets)\n" +
+             "- Join-first style lessons: (2-5 bullets)\n" +
+             "- Subquery style lessons: (2-5 bullets)\n" +
+             "- Aggregation style lessons: (2-5 bullets)" if not is_selector else "")
+        )
+        prompt = f"""You are a knowledge summarization expert. Given accumulated reflections, summarize into concise, general insights. 
+Focus on high-impact, abstract patterns; avoid specifics. Output only in this structure:
+{output_structure}
+
+# Reflections: {insights_str}
+"""
+        response = self.call_llm(prompt)
+        summary = {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
+        current_key = None
+        for line in response.splitlines():
+            line = line.strip()
+            if line.startswith("- General lessons:"):
+                current_key = "general"
+            elif not is_selector and line.startswith("- Default style lessons:"):
+                current_key = "default"
+            elif not is_selector and line.startswith("- Join-first style lessons:"):
+                current_key = "join-first"
+            elif not is_selector and line.startswith("- Subquery style lessons:"):
+                current_key = "subquery"
+            elif not is_selector and line.startswith("- Aggregation style lessons:"):
+                current_key = "aggregation"
+            elif line.startswith("- ") and current_key:
+                summary[current_key].append(line)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = os.path.join(knowledge_dir, f"{'selector_' if is_selector else ''}summary_{timestamp}.json")
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=4)
+        return summary
+
+    def call_llm(self, prompt):
+        res = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5
+        )
+        return res.choices[0].message.content.strip()
