@@ -218,6 +218,7 @@ class SelectorAgent:
         self.model_name = model
         self.knowledge_dir = "./knowledge/selector"
         self.prompt_file = "prompt/prompt_selector.txt"
+        os.makedirs(self.knowledge_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
         # Initialize prompt file if not exists
         if not os.path.exists(self.prompt_file):
@@ -239,7 +240,6 @@ Selected SQL: <sql>
                 f.write(initial_prompt)
 
     def get_latest_selector_reflection(self):
-        """Read the most recent selector reflection JSON."""
         files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
         if not files:
             return ""
@@ -350,6 +350,7 @@ class SelectorAgentTeacher:
         self.model_name = model
         self.knowledge_dir = "./knowledge/selector"
         self.prompt_file = "prompt/prompt_selector.txt"
+        self.prompt_backup_prefix = "prompt_selector_"
         os.makedirs(self.knowledge_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
 
@@ -363,12 +364,22 @@ class SelectorAgentTeacher:
         return reflections, latest_file
 
     def rewrite_prompt(self):
-        """Rewrite the selector prompt based on reflections, deduplicate, and save new reflection."""
+        """Backup current prompt, rewrite based on reflections, deduplicate, and save new reflection."""
         reflections, latest_file = self.get_latest_selector_reflection()
         general_reflections = reflections.get("general", [])
         reflections_str = "\n".join(general_reflections)
 
-        # Read current prompt
+        # Backup current prompt
+        if os.path.exists(self.prompt_file):
+            with open(self.prompt_file, 'r', encoding='utf-8') as f:
+                current_prompt = f.read()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            backup_filename = os.path.join(os.path.dirname(self.prompt_file), f"{self.prompt_backup_prefix}{timestamp}.txt")
+            with open(backup_filename, 'w', encoding='utf-8') as f:
+                f.write(current_prompt)
+            print(f"🧠 Backed up current selector prompt to {backup_filename}")
+
+        # Read current prompt (for rewrite)
         with open(self.prompt_file, 'r', encoding='utf-8') as f:
             current_prompt = f.read()
 
@@ -390,7 +401,7 @@ Avoid specific table/column names; focus on general patterns (e.g., prioritizing
         with open(self.prompt_file, 'w', encoding='utf-8') as f:
             f.write(response)
 
-        # Deduplicate reflections and save
+        # Deduplicate reflections and save new file
         deduped_reflections = {"general": list(dict.fromkeys(general_reflections))}
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         new_filename = os.path.join(self.knowledge_dir, f"selector_reflection_{timestamp}.json")
