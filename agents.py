@@ -10,8 +10,8 @@ import re  # For parsing LLM output
 
 class SQLPlanGeneratorAgent:
     def __init__(self, api_key, base_url, model="gpt-3.5-turbo", style="default"):
-        self.api_key=api_key
-        self.base_url=base_url
+        self.api_key = api_key
+        self.base_url = base_url
         self.client = None
         self.model_name = model
         self.style = style
@@ -206,7 +206,6 @@ Focus on abstract patterns; avoid references to specific tables/columns/question
             with open(os.path.join(knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
                 latest_reflections = json.load(f)
 
-        # Merge per key: append new, deduplicate
         for key in latest_reflections:
             combined = latest_reflections[key] + new_insights.get(key, [])
             latest_reflections[key] = list(dict.fromkeys(combined))
@@ -221,14 +220,14 @@ Focus on abstract patterns; avoid references to specific tables/columns/question
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(merged_insights, f, indent=4)
         return merged_insights
-    
+
 class SelectorAgent:
     def __init__(self, api_key, base_url, model="solar-pro2"):
         self.api_key = api_key
         self.base_url = base_url
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model
-        self.knowledge_dir = "./knowledge/selector"  # Separate sub-dir for selector reflections
+        self.knowledge_dir = "./knowledge/selector"
         os.makedirs(self.knowledge_dir, exist_ok=True)
 
     def get_latest_selector_reflection(self):
@@ -247,8 +246,11 @@ class SelectorAgent:
         reflection = self.get_latest_selector_reflection()
         candidates_str = "\n".join([f"Style: {style}, SQL: {sql}" for style, sql in candidates])
 
-        prompt = f"""You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous reflections on selections, choose the best SQL. 
-Consider correctness, efficiency, and alignment with intent. Output only the selected style and SQL in format: Selected Style: <style>\nSelected SQL: <sql>
+        prompt = f"""You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous selector reflections, choose the best SQL. 
+Consider correctness (if executable, prefer matching intent), efficiency (simpler queries preferred), and alignment with question intent. Use reflections to avoid past mistakes.
+Output only in this format:
+Selected Style: <style>
+Selected SQL: <sql>
 
 # Question: {question}
 
@@ -256,13 +258,12 @@ Consider correctness, efficiency, and alignment with intent. Output only the sel
 
 # Candidates: {candidates_str}
 
-# Previous Reflections: {reflection}
+# Previous Selector Reflections: {reflection}
 """
         response = self.call_llm(prompt)
-        # Parse response
         lines = response.splitlines()
-        selected_style = lines[0].split(": ")[1] if lines else ""
-        selected_sql = lines[1].split(": ")[1] if len(lines) > 1 else ""
+        selected_style = lines[0].split(": ")[1] if lines else candidates[0][0]  # Fallback to first style
+        selected_sql = lines[1].split(": ")[1] if len(lines) > 1 else candidates[0][1]  # Fallback to first SQL
         return selected_style, selected_sql
 
     def call_llm(self, prompt):
@@ -283,17 +284,17 @@ class SelectorReflectionAgent:
         os.makedirs(self.knowledge_dir, exist_ok=True)
 
     def generate_insights(self, question, schema, golden_sql, selected_style, selected_sql, was_correct):
-        """Generate reflections on the selection."""
+        """Generate reflections on the selector's choice."""
         diff = difflib.unified_diff(
             golden_sql.splitlines(), selected_sql.splitlines(),
             fromfile="golden_sql", tofile="selected_sql", lineterm=""
         )
         diff_text = "\n".join(diff)
-
         outcome = "correct" if was_correct else "incorrect"
 
-        prompt = f"""You are a selector reflection expert. Analyze why the selection of {selected_style} style led to an {outcome} outcome. 
-Provide 3-5 general bullet-point lessons for better future selections, focusing on abstract patterns (e.g., when to prefer subqueries). Avoid specifics.
+        prompt = f"""You are a selector reflection expert. Given the question, schema, golden SQL, selected SQL, and whether the selection was correct, analyze why the choice led to an {outcome} outcome. 
+Provide 3-5 general bullet-point lessons for better future selections, focusing on abstract patterns (e.g., when to prefer join-based styles). Avoid specific table/column names.
+Output only bullet-point lessons starting with "- ".
 
 # Question: {question}
 
@@ -301,15 +302,17 @@ Provide 3-5 general bullet-point lessons for better future selections, focusing 
 
 # Golden SQL: {golden_sql}
 
+# Selected Style: {selected_style}
+
 # Selected SQL: {selected_sql}
 
-# SQL Diff: {diff_text}
+# Outcome: {outcome}
 
-# Bullet-point lessons:
+# SQL Diff: {diff_text}
 """
         response = self.call_llm(prompt)
         insights = [line.strip() for line in response.splitlines() if line.strip().startswith("- ")]
-        return {"general": insights}  # Simple structure for selector
+        return {"general": insights}
 
     def call_llm(self, prompt):
         res = self.client.chat.completions.create(
@@ -320,6 +323,7 @@ Provide 3-5 general bullet-point lessons for better future selections, focusing 
         return res.choices[0].message.content.strip()
 
     def merge_reflections(self, new_insights):
+        """Merge new selector insights with the latest JSON."""
         latest_reflections = {"general": []}
         files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
         if files:
@@ -329,14 +333,15 @@ Provide 3-5 general bullet-point lessons for better future selections, focusing 
 
         for key in latest_reflections:
             combined = latest_reflections[key] + new_insights.get(key, [])
-            latest_reflections[key] = list(dict.fromkeys(combined))  # Dedup
+            latest_reflections[key] = list(dict.fromkeys(combined))
         return latest_reflections
 
     def save_reflection(self, question, schema, golden_sql, selected_style, selected_sql, was_correct):
+        """Save selector reflection insights to a timestamped JSON file."""
         insights = self.generate_insights(question, schema, golden_sql, selected_style, selected_sql, was_correct)
         merged_insights = self.merge_reflections(insights)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         filename = os.path.join(self.knowledge_dir, f"selector_reflection_{timestamp}.json")
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(merged_insights, f, indent=4)
-        return merged_insights    
+        return merged_insights

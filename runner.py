@@ -40,7 +40,7 @@ async def main(idx, example, schema):
     candidates = list(zip([f"Agent-{agent.style}" for agent in agents], sql_outputs))
     
     # 4. Verification        
-    db_path=f"./datasets/spider/database/{db_id}/{db_id}.sqlite"    
+    db_path = f"./datasets/spider/database/{db_id}/{db_id}.sqlite"    
     verifier = VerifierAgent(db_path=db_path)
     
     valid_gold, gold_sql_value = verifier.verify(gold_sql)
@@ -74,25 +74,35 @@ async def main(idx, example, schema):
         if ok:
             results.append((name, sql, sql_value, ok))
     
-    # 6. Selector Agent: Choose one from candidates
+    # 6. Base reflection
+    base_insights = reflection_agent.save_reflection(question, schema, gold_sql, styled_predictions)
+    print(f"🧠 Base Agent Accumulated Insights:")
+    for section, insights in base_insights.items():
+        print(f"  {section.capitalize()}:")
+        for insight in insights:
+            print(f"    {insight}")
+    print("--------------------------------\n")
+    
+    # 7. Selector Agent: Choose one from candidates
     selector_agent = SelectorAgent(api_key=api_key, base_url=base_url, model=model)
-    candidates_list = [(style, sql) for style, sql in styled_predictions.items()]  # List of (style, sql)
+    candidates_list = [(style, sql) for style, sql in styled_predictions.items()]
     selected_style, selected_sql = selector_agent.select_sql(question, schema, candidates_list)
-
-    # 7. Compare selected to golden
+    
+    # 8. Verify selected SQL
     ok_selected, selected_value = verifier.verify(selected_sql)
-    is_correct = ok_selected and selected_value == gold_sql_value
-    print(f"Selected Style: {selected_style}, Correct: {is_correct}")
-
-    # 8. Selector Reflection
+    selector_correct = ok_selected and selected_value == gold_sql_value
+    print(f"🧠 Selected Style: {selected_style}, Correct: {selector_correct}")
+    print(f"🧠 Selected SQL: {selected_sql}")
+    
+    # 9. Selector Reflection
     selector_reflection_agent = SelectorReflectionAgent(api_key=api_key, base_url=base_url, model=model)
-    selector_insights = selector_reflection_agent.save_reflection(question, schema, gold_sql, selected_style, selected_sql, is_correct)
+    selector_insights = selector_reflection_agent.save_reflection(question, schema, gold_sql, selected_style, selected_sql, selector_correct)
     print(f"🧠 Selector Accumulated Insights:")
     for insight in selector_insights["general"]:
         print(f"  {insight}")
     print("--------------------------------\n")
-    
-    return style_correct_dict, "ret_error"
+                                                        
+    return style_correct_dict, selector_correct, "ret_error"
 
 if __name__ == "__main__":
     # Parse command-line arguments
@@ -120,17 +130,17 @@ if __name__ == "__main__":
     start_idx = args.start
     n_examples = args.n
     
-    # Initialize per-style correct counts
+    # Initialize per-style and selector correct counts
     agent_styles = ["default", "join-first", "subquery", "aggregation"]
     style_correct_counts = {style: 0 for style in agent_styles}
-    
+    selector_correct_count = 0  # Track selector success
     total_correct = 0  # Count examples where at least one style is correct
     total_error = {}
     total_error['miss'] = 0
     for idx in range(start_idx, start_idx + n_examples):
         example = dataset[idx]
         schema = schemas[example["db_id"]]
-        style_correct_dict, error = asyncio.run(main(idx, example, schema))
+        style_correct_dict, selector_correct, error = asyncio.run(main(idx, example, schema))
         
         # Update stats
         any_correct = False
@@ -140,6 +150,8 @@ if __name__ == "__main__":
                 any_correct = True
         if any_correct:
             total_correct += 1
+        if selector_correct:
+            selector_correct_count += 1
             
     # Print overall stats
     print(f"Total examples where at least one style correct: {total_correct}/{n_examples}")
@@ -150,3 +162,8 @@ if __name__ == "__main__":
         correct = style_correct_counts[style]
         accuracy = (correct / n_examples) * 100 if n_examples > 0 else 0
         print(f"Style '{style}': {correct}/{n_examples} ({accuracy:.2f}%)")
+    
+    # Print selector stats
+    print("\nSelector Performance Statistics:")
+    selector_accuracy = (selector_correct_count / n_examples) * 100 if n_examples > 0 else 0
+    print(f"Selector: {selector_correct_count}/{n_examples} ({selector_accuracy:.2f}%)")
