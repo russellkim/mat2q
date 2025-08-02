@@ -1,7 +1,7 @@
-# Text-to-SQL with Multi-Agent Reflective Learning
+# Text-to-SQL with Multi-Agent Reflection Learning
 
 ## Overview
-This project implements a multi-agent text-to-SQL system that converts natural language questions into SQLite-compatible SQL queries, evaluated on the Spider dataset [Yu et al., 2018]. It features a hierarchical architecture with style-specific SQL generation, a selector for choosing the best query, and reflective agents that iteratively improve performance by learning from past mistakes. The system includes dynamic prompt rewriting and reflection resets, logged for analysis, making it a robust platform for research into self-evolving AI systems, targeting top AI conferences like ACL and ICLR.
+This project implements a multi-agent text-to-SQL system that converts natural language questions into SQLite-compatible SQL queries, evaluated on the Spider dataset [Yu et al., 2018]. It features a hierarchical architecture with style-specific SQL generation, a selector for choosing the best query, and reflection agents that iteratively improve performance by learning from past mistakes. The system includes dynamic prompt rewriting and reflection resets, logged for analysis, making it a robust platform for research into self-evolving AI systems, targeting top AI conferences like ACL and ICLR.
 
 ## Key Features
 - **Multi-Agent SQL Generation**: Four `SQLPlanGeneratorAgent` instances generate SQL queries using distinct strategies:
@@ -10,7 +10,7 @@ This project implements a multi-agent text-to-SQL system that converts natural l
   - **Subquery**: Emphasizes nested subqueries.
   - **Aggregation**: Focuses on aggregation logic (e.g., COUNT, SUM).
 - **Selector Agent**: A `SelectorAgent` chooses the best SQL from candidates using an external prompt (`prompt/prompt_selector.txt`), informed by question intent, schema constraints, and past selector reflections.
-- **Reflective Learning**:
+- **Reflection Learning**:
   - `ReflectionAgent`: Generates general and style-specific insights for base agents, stored as JSON in `knowledge/reflection_<timestamp>.json`.
   - `SelectorReflectionAgent`: Reflects on selector choices, stored in `knowledge/selector/selector_reflection_<timestamp>.json`, with resets to empty (`{"general": []}`) after prompt rewrites to focus on new insights.
 - **Prompt Rewriting**: A `SelectorAgentTeacher` rewrites the selector prompt based on accumulated reflections when the `"general"` list exceeds `--rewrite-selector-size` and the reflection file is at least `--min-reflection-age` examples old. Previous prompts are backed up as `prompt/prompt_selector_<timestamp>.txt`.
@@ -55,7 +55,7 @@ python runner.py --start 100 --n 20 --rewrite-selector-size 8 --min-reflection-a
 Output includes per-example logs, base/selector reflections, selector choices, rewritten prompts, and final statistics (per-style and selector accuracy, rewrite events, reflection file count).
 
 ## Research Context
-This system is designed for research in text-to-SQL generation, emphasizing self-improving agents through reflective learning and dynamic prompt evolution. Key contributions include:
+This system is designed for research in text-to-SQL generation, emphasizing self-improving agents through reflection learning and dynamic prompt evolution. Key contributions include:
 - Hierarchical architecture with style-specific generation and selection [Pan et al., 2023].
 - Reflective feedback loops for base agents and selector, with periodic resets to focus learning [Shinn et al., 2023].
 - Dynamic prompt rewriting with versioned backups and metadata logging for interpretability [Huang et al., 2024].
