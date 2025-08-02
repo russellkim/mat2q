@@ -29,14 +29,11 @@ class SQLPlanGeneratorAgent:
             await self.client.close()
 
     def get_latest_reflection(self):
-        """Read the most recent summary or reflection JSON from the knowledge directory."""
+        """Read the most recent reflection JSON from the knowledge directory."""
         knowledge_dir = "./knowledge"
         if not os.path.exists(knowledge_dir):
             return ""
-        # Prioritize summaries
-        files = [f for f in os.listdir(knowledge_dir) if f.startswith("summary_") and f.endswith(".json")]
-        if not files:
-            files = [f for f in os.listdir(knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
+        files = [f for f in os.listdir(knowledge_dir) if f.startswith("reflection_") and f.endswith(".json")]
         if not files:
             return ""
         latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(knowledge_dir, x)))
@@ -220,25 +217,11 @@ class SelectorAgent:
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model
         self.knowledge_dir = "./knowledge/selector"
-        os.makedirs(self.knowledge_dir, exist_ok=True)
-
-    def get_latest_selector_reflection(self):
-        """Read the most recent selector summary or reflection JSON."""
-        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_summary_") and f.endswith(".json")]
-        if not files:
-            files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
-        if not files:
-            return ""
-        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
-        with open(os.path.join(self.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
-            reflections = json.load(f)
-        general = reflections.get("general", [])
-        return "# Previous Selector Reflections:\n" + "\n".join(general)
-
-    def select_sql(self, question, schema, candidates):
-        reflection = self.get_latest_selector_reflection()
-        candidates_str = "\n".join([f"Style: {style}, SQL: {sql}" for style, sql in candidates])
-        prompt = f"""You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous selector reflections, choose the best SQL. 
+        self.prompt_file = "prompt/prompt_selector.txt"
+        os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
+        # Initialize prompt file if not exists
+        if not os.path.exists(self.prompt_file):
+            initial_prompt = """You are a SQL selector expert. Given the question, schema, candidate SQLs from different styles, and previous selector reflections, choose the best SQL. 
 Consider correctness (if executable, prefer matching intent), efficiency (simpler queries preferred), and alignment with question intent. Use reflections to avoid past mistakes.
 Output only in this format:
 Selected Style: <style>
@@ -252,6 +235,32 @@ Selected SQL: <sql>
 
 # Previous Selector Reflections: {reflection}
 """
+            with open(self.prompt_file, 'w', encoding='utf-8') as f:
+                f.write(initial_prompt)
+
+    def get_latest_selector_reflection(self):
+        """Read the most recent selector reflection JSON."""
+        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
+        if not files:
+            return ""
+        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
+        with open(os.path.join(self.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
+            reflections = json.load(f)
+        general = reflections.get("general", [])
+        return "# Previous Selector Reflections:\n" + "\n".join(general)
+
+    def select_sql(self, question, schema, candidates):
+        reflection = self.get_latest_selector_reflection()
+        candidates_str = "\n".join([f"Style: {style}, SQL: {sql}" for style, sql in candidates])
+        # Read prompt from file
+        with open(self.prompt_file, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
+        prompt = prompt_template.format(
+            question=question,
+            schema=schema,
+            candidates_str=candidates_str,
+            reflection=reflection
+        )
         response = self.call_llm(prompt)
         lines = response.splitlines()
         selected_style = lines[0].split(": ")[1] if lines else candidates[0][0]
@@ -333,74 +342,62 @@ Output only bullet-point lessons starting with "- ".
             json.dump(merged_insights, f, indent=4)
         return merged_insights
 
-class KnowledgeSummarizerAgent:
+class SelectorAgentTeacher:
     def __init__(self, api_key, base_url, model="solar-pro2"):
         self.api_key = api_key
         self.base_url = base_url
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model
-        self.knowledge_dir = "./knowledge"
-        self.selector_knowledge_dir = "./knowledge/selector"
+        self.knowledge_dir = "./knowledge/selector"
+        self.prompt_file = "prompt/prompt_selector.txt"
         os.makedirs(self.knowledge_dir, exist_ok=True)
-        os.makedirs(self.selector_knowledge_dir, exist_ok=True)
-        self.styles = ["default", "join-first", "subquery", "aggregation"]
+        os.makedirs(os.path.dirname(self.prompt_file), exist_ok=True)
 
-    def summarize_reflections(self, is_selector=False):
-        """Summarize all reflections in the given directory."""
-        knowledge_dir = self.selector_knowledge_dir if is_selector else self.knowledge_dir
-        prefix = "selector_reflection_" if is_selector else "reflection_"
-        files = [f for f in os.listdir(knowledge_dir) if f.startswith(prefix) and f.endswith(".json")]
+    def get_latest_selector_reflection(self):
+        files = [f for f in os.listdir(self.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
         if not files:
-            return {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
-        
-        all_insights = {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
-        for file in files:
-            with open(os.path.join(knowledge_dir, file), 'r', encoding='utf-8') as f:
-                insights = json.load(f)
-                for key in all_insights:
-                    all_insights[key].extend(insights.get(key, []))
-        
-        # Deduplicate before summarization
-        for key in all_insights:
-            all_insights[key] = list(dict.fromkeys(all_insights[key]))
+            return {"general": []}, None
+        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(self.knowledge_dir, x)))
+        with open(os.path.join(self.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
+            reflections = json.load(f)
+        return reflections, latest_file
 
-        insights_str = "\n".join([f"{key.capitalize()}: " + "; ".join(all_insights[key]) for key in all_insights])
-        output_structure = (
-            "- General lessons: (5-10 concise bullets)\n" +
-            ("- Default style lessons: (2-5 bullets)\n" +
-             "- Join-first style lessons: (2-5 bullets)\n" +
-             "- Subquery style lessons: (2-5 bullets)\n" +
-             "- Aggregation style lessons: (2-5 bullets)" if not is_selector else "")
-        )
-        prompt = f"""You are a knowledge summarization expert. Given accumulated reflections, summarize into concise, general insights. 
-Focus on high-impact, abstract patterns; avoid specifics. Output only in this structure:
-{output_structure}
+    def rewrite_prompt(self):
+        """Rewrite the selector prompt based on reflections, deduplicate, and save new reflection."""
+        reflections, latest_file = self.get_latest_selector_reflection()
+        general_reflections = reflections.get("general", [])
+        reflections_str = "\n".join(general_reflections)
 
-# Reflections: {insights_str}
+        # Read current prompt
+        with open(self.prompt_file, 'r', encoding='utf-8') as f:
+            current_prompt = f.read()
+
+        prompt = f"""You are a prompt optimization expert. Given the current selector prompt and accumulated selector reflections, rewrite the prompt to incorporate key lessons for better SQL selection. 
+Ensure the rewritten prompt remains concise, improves selection accuracy, and retains the output format: 'Selected Style: <style>\nSelected SQL: <sql>'.
+Avoid specific table/column names; focus on general patterns (e.g., prioritizing joins for multi-table queries).
+
+# Current Prompt:
+{current_prompt}
+
+# Reflections:
+{reflections_str}
+
+# Output only the rewritten prompt:
 """
         response = self.call_llm(prompt)
-        summary = {"general": []} if is_selector else {"general": [], "default": [], "join-first": [], "subquery": [], "aggregation": []}
-        current_key = None
-        for line in response.splitlines():
-            line = line.strip()
-            if line.startswith("- General lessons:"):
-                current_key = "general"
-            elif not is_selector and line.startswith("- Default style lessons:"):
-                current_key = "default"
-            elif not is_selector and line.startswith("- Join-first style lessons:"):
-                current_key = "join-first"
-            elif not is_selector and line.startswith("- Subquery style lessons:"):
-                current_key = "subquery"
-            elif not is_selector and line.startswith("- Aggregation style lessons:"):
-                current_key = "aggregation"
-            elif line.startswith("- ") and current_key:
-                summary[current_key].append(line)
-        
+
+        # Save rewritten prompt
+        with open(self.prompt_file, 'w', encoding='utf-8') as f:
+            f.write(response)
+
+        # Deduplicate reflections and save
+        deduped_reflections = {"general": list(dict.fromkeys(general_reflections))}
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        filename = os.path.join(knowledge_dir, f"{'selector_' if is_selector else ''}summary_{timestamp}.json")
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=4)
-        return summary
+        new_filename = os.path.join(self.knowledge_dir, f"selector_reflection_{timestamp}.json")
+        with open(new_filename, 'w', encoding='utf-8') as f:
+            json.dump(deduped_reflections, f, indent=4)
+
+        return response, deduped_reflections
 
     def call_llm(self, prompt):
         res = self.client.chat.completions.create(

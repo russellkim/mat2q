@@ -1,18 +1,25 @@
 import asyncio
-from agents import SQLPlanGeneratorAgent, VerifierAgent, ReflectionAgent, SelectorAgent, SelectorReflectionAgent, KnowledgeSummarizerAgent
+from agents import SQLPlanGeneratorAgent, VerifierAgent, ReflectionAgent, SelectorAgent, SelectorReflectionAgent, SelectorAgentTeacher
 from utils import load_dataset
 import os
 from dotenv import load_dotenv
 import argparse
+import json
 
-async def main(idx, example, schema, api_key, base_url, model):
+async def main(idx, example, schema):
     print(f"Running example {idx}...")
 
     question, db_id, gold_sql = example["question"], example["db_id"], example["query"]
-        
+    
+    load_dotenv()
+    api_key = os.getenv('UPSTAGE_API_KEY_0')
+    base_url = os.getenv('UPSTAGE_API_BASE')
+    model = "solar-pro2"
+    
     # 1. Multiple SQL Generator Agents with different strategies
     print("🧠 Generating SQL...")      
-    agent_styles = ["default", "join-first", "subquery", "aggregation"]
+    #agent_styles = ["default", "join-first", "subquery", "aggregation"]
+    agent_styles = ["default"]    
     
     # Create agents and use them as async context managers
     agents = [
@@ -95,27 +102,40 @@ async def main(idx, example, schema, api_key, base_url, model):
     for insight in selector_insights["general"]:
         print(f"  {insight}")
     print("--------------------------------\n")
-                                                        
-    return style_correct_dict, selector_correct, "ret_error"
+    
+    # 10. Check for prompt rewrite
+    rewrite_triggered = False
+    selector_teacher = SelectorAgentTeacher(api_key=api_key, base_url=base_url, model=model)
+    files = [f for f in os.listdir(selector_teacher.knowledge_dir) if f.startswith("selector_reflection_") and f.endswith(".json")]
+    if files:
+        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(selector_teacher.knowledge_dir, x)))
+        with open(os.path.join(selector_teacher.knowledge_dir, latest_file), 'r', encoding='utf-8') as f:
+            latest_reflections = json.load(f)
+        if len(latest_reflections.get("general", [])) >= args.rewrite_selector_size:
+            print(f"🧠 Rewriting selector prompt at example {idx}...")
+            new_prompt, deduped_reflections = selector_teacher.rewrite_prompt()
+            rewrite_triggered = True
+            print(f"🧠 New Selector Prompt:\n{new_prompt}")
+            print(f"🧠 Deduplicated Selector Reflections:")
+            for insight in deduped_reflections["general"]:
+                print(f"  {insight}")
+            print("--------------------------------\n")
+    
+    return style_correct_dict, selector_correct, rewrite_triggered, "ret_error"
 
-if __name__ == "__main__":        
-    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index, number of examples, and summarization interval.")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Spider dataset evaluation with configurable start index, number of examples, and selector prompt rewrite size.")
     parser.add_argument("--start", type=int, default=95, help="Starting index for dataset (default: 95)")
     parser.add_argument("--n", type=int, default=5, help="Number of examples to process (default: 5)")
-    parser.add_argument("--summary-interval", type=int, default=10, help="Interval for summarizing reflections (default: 10)")
+    parser.add_argument("--rewrite-selector-size", type=int, default=10, help="Threshold for number of selector reflection items to trigger prompt rewrite (default: 10)")
     args = parser.parse_args()
-
-    load_dotenv()
-    api_key = os.getenv('UPSTAGE_API_KEY_0')
-    base_url = os.getenv('UPSTAGE_API_BASE')
-    model = "solar-pro2"
 
     if args.start < 0:
         raise ValueError("Start index (--start) must be non-negative.")
     if args.n <= 0:
         raise ValueError("Number of examples (--n) must be positive.")
-    if args.summary_interval <= 0:
-        raise ValueError("Summary interval (--summary-interval) must be positive.")
+    if args.rewrite_selector_size <= 0:
+        raise ValueError("Rewrite selector size (--rewrite-selector-size) must be positive.")
 
     dataset, schemas = load_dataset('./datasets/spider', 'dev')    
 
@@ -127,20 +147,18 @@ if __name__ == "__main__":
 
     start_idx = args.start
     n_examples = args.n
-    summary_interval = args.summary_interval
     
     agent_styles = ["default", "join-first", "subquery", "aggregation"]
     style_correct_counts = {style: 0 for style in agent_styles}
     selector_correct_count = 0
     total_correct = 0
     total_error = {'miss': 0}
-    summarization_count = 0  # Track summarizations
+    rewrite_count = 0  # Track prompt rewrites
 
-    summarizer_agent = KnowledgeSummarizerAgent(api_key=api_key, base_url=base_url, model=model)
     for idx in range(start_idx, start_idx + n_examples):
         example = dataset[idx]
         schema = schemas[example["db_id"]]
-        style_correct_dict, selector_correct, error = asyncio.run(main(idx, example, schema, api_key, base_url, model))
+        style_correct_dict, selector_correct, rewrite_triggered, error = asyncio.run(main(idx, example, schema))
         
         # Update stats
         any_correct = False
@@ -152,22 +170,8 @@ if __name__ == "__main__":
             total_correct += 1
         if selector_correct:
             selector_correct_count += 1
-        
-        # Summarize if at interval
-        if (idx - start_idx + 1) % summary_interval == 0:
-            print(f"🧠 Summarizing reflections at example {idx}...")
-            base_summary = summarizer_agent.summarize_reflections(is_selector=False)
-            selector_summary = summarizer_agent.summarize_reflections(is_selector=True)
-            summarization_count += 1
-            print(f"🧠 Base Agent Summary:")
-            for section, insights in base_summary.items():
-                print(f"  {section.capitalize()}:")
-                for insight in insights:
-                    print(f"    {insight}")
-            print(f"🧠 Selector Summary:")
-            for insight in selector_summary["general"]:
-                print(f"  {insight}")
-            print("--------------------------------\n")
+        if rewrite_triggered:
+            rewrite_count += 1
     
     print(f"Total examples where at least one style correct: {total_correct}/{n_examples}")
     print("\nPer-Style Performance Statistics:")
@@ -180,4 +184,4 @@ if __name__ == "__main__":
     selector_accuracy = (selector_correct_count / n_examples) * 100 if n_examples > 0 else 0
     print(f"Selector: {selector_correct_count}/{n_examples} ({selector_accuracy:.2f}%)")
     
-    print(f"\nSummarization Events: {summarization_count}")
+    print(f"\nSelector Prompt Rewrite Events: {rewrite_count}")
